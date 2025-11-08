@@ -1,0 +1,17 @@
+# Core Dependencies with face-recognition (includes dlib)
+face-recognition>=1.3.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+pandas>=2.0.0
+Pillow>=10.0.0
+
+# Data Analysis
+scipy>=1.11.0
+scikit-learn>=1.3.0
+matplotlib>=3.8.0
+
+# Testing
+pytest>=7.4.0
+
+# Note: face-recognition package includes dlib binaries
+# No need to install dlib separately
