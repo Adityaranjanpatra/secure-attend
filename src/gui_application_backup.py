@@ -34,92 +34,6 @@ except ImportError:
     from privacy_manager import PrivacyManager
 
 
-class AttendanceTracker:
-    """Manages smooth attendance tracking without flickering"""
-
-    def __init__(self):
-        # Detection smoothing
-        self.detection_history = {}
-        self.detection_threshold = 5
-        self.detection_cooldown = 30
-
-        # UI state management
-        self.ui_states = {}
-        self.display_duration = 45
-
-        # Frame counter
-        self.frame_count = 0
-
-        # Today's recognized users
-        self.recognized_today = set()
-
-        # Liveness check history
-        self.liveness_history = {}
-        self.liveness_window = 10
-
-    def update_detection(self, user_id: str, is_detected: bool,
-                         liveness_score: float = None) -> bool:
-        """Update detection state with smoothing"""
-        current_frame = self.frame_count
-
-        if user_id not in self.detection_history:
-            self.detection_history[user_id] = {
-                'consecutive_detections': 0,
-                'last_seen': 0,
-                'is_stable': False
-            }
-
-        state = self.detection_history[user_id]
-
-        if is_detected:
-            state['consecutive_detections'] += 1
-            state['last_seen'] = current_frame
-
-            if state['consecutive_detections'] >= self.detection_threshold:
-                state['is_stable'] = True
-        else:
-            frames_since_seen = current_frame - state['last_seen']
-
-            if frames_since_seen > self.detection_cooldown:
-                state['consecutive_detections'] = 0
-                state['is_stable'] = False
-
-        return state['is_stable']
-
-    def update_liveness_smooth(self, user_id: str, liveness_score: float):
-        """Smooth liveness detection"""
-        if user_id not in self.liveness_history:
-            from collections import deque
-            self.liveness_history[user_id] = deque(maxlen=self.liveness_window)
-
-        self.liveness_history[user_id].append(liveness_score)
-        smoothed_score = np.mean(self.liveness_history[user_id])
-        is_live = smoothed_score >= 0.7
-
-        return is_live, smoothed_score
-
-    def should_display(self, user_id: str) -> bool:
-        """Check if we should display UI for this user"""
-        if user_id not in self.detection_history:
-            return False
-
-        state = self.detection_history[user_id]
-        frames_since_seen = self.frame_count - state['last_seen']
-
-        return state['is_stable'] and frames_since_seen < self.display_duration
-
-    def increment_frame(self):
-        """Increment frame counter"""
-        self.frame_count += 1
-
-    def reset(self):
-        """Reset tracker"""
-        self.detection_history.clear()
-        self.ui_states.clear()
-        self.liveness_history.clear()
-        self.frame_count = 0
-
-
 class SecureAttendApp:
     """Main GUI Application"""
 
@@ -141,9 +55,7 @@ class SecureAttendApp:
         # Setup GUI
         self.root = tk.Tk()
         self.setup_main_window()
-
-        # Load users AFTER GUI is shown (prevents freezing)
-        self.root.after(500, self.load_registered_users_fast)  # ← ADD THIS LINE
+        self.load_registered_users()
 
         print("✓ SecureAttend Application initialized")
 
@@ -517,16 +429,12 @@ class SecureAttendApp:
 
         ttk.Label(status_frame, text="v3.0", relief='sunken').pack(side='right')
 
-    def load_registered_users_fast(self):
-        """
-        FAST user loading - HOG only (no CNN to prevent hanging)
-        This runs quickly without freezing the GUI
-        """
+    def load_registered_users(self):
+        """Load registered users - FIXED with better error handling"""
         try:
             images_path = self.config.get('images_folder', 'registered_faces')
             if not os.path.exists(images_path):
                 os.makedirs(images_path)
-                self.update_status("No registered users")
                 return
 
             self.known_encodings = []
@@ -534,135 +442,116 @@ class SecureAttendApp:
             self.known_user_ids = []
 
             print(f"\n{'=' * 60}")
-            print(f"  LOADING REGISTERED USERS (FAST MODE)")
+            print(f"  LOADING REGISTERED USERS")
             print(f"{'=' * 60}")
             print(f"Looking in: {images_path}\n")
+
+            # Get all users from database
+            all_users = self.db.get_all_users()
+            print(f"Found {len(all_users)} users in database")
 
             loaded_count = 0
             failed_images = []
 
-            image_files = [f for f in os.listdir(images_path)
-                           if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            for filename in os.listdir(images_path):
+                if filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    img_path = os.path.join(images_path, filename)
+                    user_id = os.path.splitext(filename)[0]  # Remove extension
 
-            for filename in image_files:
-                img_path = os.path.join(images_path, filename)
-                user_id = os.path.splitext(filename)[0]
+                    print(f"Processing: {filename}")
 
-                print(f"Processing: {filename}... ", end='', flush=True)
+                    # Load image with better error handling
+                    img = cv2.imread(img_path)
 
-                # Load image
-                img = cv2.imread(img_path)
-
-                # Validate image
-                if img is None:
-                    print("✗ Cannot load")
-                    failed_images.append((filename, "Cannot load image"))
-                    continue
-
-                if img.shape[0] < 100 or img.shape[1] < 100:
-                    print("✗ Too small")
-                    failed_images.append((filename, "Image too small"))
-                    continue
-
-                # Convert to RGB
-                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-                # FAST face detection - HOG only, single upsampling
-                # This is MUCH faster than CNN and prevents freezing
-                face_locations = face_recognition.face_locations(
-                    rgb_img,
-                    model='hog',  # HOG is fast
-                    number_of_times_to_upsample=1  # Reduce upsamplings for speed
-                )
-
-                if not face_locations:
-                    print("✗ No face")
-                    failed_images.append((filename, "No face detected"))
-                    continue
-
-                # Get face encoding with minimal jitters (faster)
-                try:
-                    encodings = face_recognition.face_encodings(
-                        rgb_img,
-                        face_locations,
-                        num_jitters=1  # Reduce from default 100 to 1 for speed
-                    )
-
-                    if not encodings:
-                        print("✗ Cannot encode")
-                        failed_images.append((filename, "Cannot encode face"))
+                    if img is None:
+                        print(f"  ✗ Could not load image")
+                        failed_images.append((filename, "Failed to load image file"))
                         continue
 
-                except Exception as e:
-                    print(f"✗ Error: {e}")
-                    failed_images.append((filename, f"Encoding error: {e}"))
-                    continue
+                    # Check if image is too small
+                    if img.shape[0] < 100 or img.shape[1] < 100:
+                        print(f"  ✗ Image too small: {img.shape}")
+                        failed_images.append((filename, f"Image too small: {img.shape}"))
+                        continue
 
-                # Get user info from database
-                user_info = self.db.get_user_info(user_id)
+                    # Get face encoding with multiple detection attempts
+                    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-                if user_info:
-                    name = user_info[1]
-                    regno = user_info[2] if user_info[2] else 'N/A'
-                else:
-                    # Fallback: extract name from filename
-                    if '_' in user_id:
-                        parts = user_id.split('_', 1)
-                        name = parts[1].replace('_', ' ').title()
+                    # Try both HOG and CNN models
+                    face_locations = face_recognition.face_locations(rgb_img, model='hog')
+
+                    if not face_locations:
+                        # Try with CNN model (more accurate but slower)
+                        print(f"  ⚠ HOG failed, trying CNN model...")
+                        face_locations = face_recognition.face_locations(rgb_img, model='cnn')
+
+                    if not face_locations:
+                        # Try with different number of upsamplings
+                        print(f"  ⚠ Trying with more upsamplings...")
+                        face_locations = face_recognition.face_locations(rgb_img, number_of_times_to_upsample=2)
+
+                    if not face_locations:
+                        print(f"  ✗ No face detected after multiple attempts")
+                        failed_images.append((filename, "No face detected in image"))
+                        continue
+
+                    # Get face encodings
+                    encodings = face_recognition.face_encodings(rgb_img, face_locations)
+
+                    if not encodings:
+                        print(f"  ✗ Could not encode face")
+                        failed_images.append((filename, "Could not encode face"))
+                        continue
+
+                    # Find user in database to get correct name
+                    user_info = self.db.get_user_info(user_id)
+
+                    if user_info:
+                        name = user_info[1]  # Get name from database
+                        regno = user_info[2] if user_info[2] else 'N/A'
+                        print(f"  ✓ Loaded: {name} (Reg: {regno})")
                     else:
-                        name = user_id.replace('_', ' ').title()
-                    regno = 'N/A'
+                        # Fallback: extract name from filename
+                        if '_' in user_id:
+                            parts = user_id.split('_', 1)
+                            name = parts[1].replace('_', ' ').title()
+                        else:
+                            name = user_id.replace('_', ' ').title()
+                        print(f"  ✓ Loaded: {name} (not in database)")
 
-                # Add to known lists
-                self.known_encodings.append(encodings[0])
-                self.known_names.append(name)
-                self.known_user_ids.append(user_id)
-
-                print(f"✓ {name} ({regno})")
-                loaded_count += 1
+                    # Add to known lists
+                    self.known_encodings.append(encodings[0])
+                    self.known_names.append(name)
+                    self.known_user_ids.append(user_id)
+                    loaded_count += 1
 
             print(f"\n{'=' * 60}")
-            print(f"  RESULTS")
-            print(f"{'=' * 60}")
-            print(f"  ✓ Loaded: {loaded_count}")
-            print(f"  ✗ Failed: {len(failed_images)}")
+            print(f"  TOTAL LOADED: {loaded_count} users")
 
             if failed_images:
-                print(f"\n  Failed images:")
+                print(f"  FAILED: {len(failed_images)} images")
+                print(f"\n  Failed Images:")
                 for img_name, reason in failed_images:
                     print(f"    - {img_name}: {reason}")
 
             print(f"{'=' * 60}\n")
 
-            # Update UI
-            self.update_status(f"Loaded {loaded_count} users")
-            self.update_dashboard_stats()
+            self.update_status(f"Loaded {loaded_count} users ({len(failed_images)} failed)")
 
-            # Show result message
             if loaded_count == 0:
+                print("⚠ WARNING: No users loaded!")
+                print(f"Check if valid face images exist in: {os.path.abspath(images_path)}")
                 if failed_images:
-                    msg = f"⚠ No users loaded!\n\n"
-                    msg += f"{len(failed_images)} image(s) failed face detection.\n\n"
-                    msg += "Common issues:\n"
-                    msg += "• Face not clearly visible\n"
-                    msg += "• Poor lighting\n"
-                    msg += "• Face too small in image\n"
-                    msg += "• Image blurry or corrupted\n\n"
-                    msg += "Solution: Delete failed images and re-register users."
-                    messagebox.showwarning("No Users Loaded", msg)
-                else:
-                    messagebox.showinfo("No Users",
-                                        "No registered users found.\nPlease register users first.")
-            else:
-                if hasattr(self, 'root') and self.root.winfo_exists():
-                    # Only show success if there were users loaded
-                    print(f"✓ Successfully loaded {loaded_count} user(s)")
+                    print("\nTroubleshooting:")
+                    print("1. Ensure face is clearly visible in photos")
+                    print("2. Face should be well-lit and front-facing")
+                    print("3. Image resolution should be at least 200x200 pixels")
+                    print("4. Try recapturing the face photo")
 
         except Exception as e:
             print(f"✗ Error loading users: {e}")
             import traceback
             traceback.print_exc()
-            self.update_status("Error loading users")
 
     def update_status(self, message="Ready"):
         """Update status bar"""
@@ -800,9 +689,8 @@ class SecureAttendApp:
         # Focus on name field
         fields['name'].focus()
 
-
     def register_user_camera(self, user_data):
-        """Camera capture for registration - with validation"""
+        """Camera capture for registration - FIXED"""
         try:
             name = user_data['name']
             regno = user_data['regno']
@@ -817,7 +705,8 @@ class SecureAttendApp:
 
             # Create images folder
             images_path = self.config.get('images_folder', 'registered_faces')
-            os.makedirs(images_path, exist_ok=True)
+            if not os.path.exists(images_path):
+                os.makedirs(images_path)
 
             img_path = os.path.join(images_path, f"{user_id}.jpg")
 
@@ -825,109 +714,106 @@ class SecureAttendApp:
             camera_index = int(self.config.get('camera_index', 0))
             cap = cv2.VideoCapture(camera_index)
 
+            # Try multiple times if camera doesn't open immediately
+            if not cap.isOpened():
+                for i in range(3):
+                    print(f"Trying to open camera... Attempt {i + 1}")
+                    cap = cv2.VideoCapture(camera_index)
+                    if cap.isOpened():
+                        break
+                    import time
+                    time.sleep(1)
+
             if not cap.isOpened():
                 self.root.after(0, lambda: messagebox.showerror("Camera Error",
-                                                                f"Cannot access camera {camera_index}"))
+                                                                f"Cannot access camera {camera_index}.\n\n" +
+                                                                "Try:\n" +
+                                                                "1. Check if camera is connected\n" +
+                                                                "2. Close other apps using camera\n" +
+                                                                "3. Change camera_index in settings"))
                 return
 
-            # Set high quality
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-            # Wait for camera to stabilize
-            for _ in range(5):
-                cap.read()
+            # Set camera properties
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
             self.update_status(f"Registering: {name}")
 
             print(f"\n{'=' * 60}")
-            print(f"  REGISTERING: {name} ({regno})")
+            print(f"  CAMERA READY - Registering: {name}")
+            print(f"  Registration Number: {regno}")
             print(f"{'=' * 60}")
             print("\nInstructions:")
-            print("  • Look directly at camera")
-            print("  • Ensure good lighting")
-            print("  • Keep face in frame")
-            print("  • Press 'S' to capture")
-            print("  • Press 'Q' to cancel\n")
+            print("  • Look directly at the camera")
+            print("  • Press 'S' to capture your face")
+            print("  • Press 'Q' to cancel registration")
+            print(f"\n{'=' * 60}\n")
 
             captured = False
             face_encoding = None
+            attempts = 0
+            max_attempts = 100  # Allow 100 frames before timeout
 
-            while True:
+            while attempts < max_attempts:
                 ret, frame = cap.read()
                 if not ret:
+                    print("Failed to read frame from camera")
+                    attempts += 1
                     continue
 
-                # Detect face for visualization
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_frame, model='hog')
+                attempts += 1
 
-                # Draw face rectangle and guide
-                display_frame = frame.copy()
-
-                if face_locations:
-                    for (top, right, bottom, left) in face_locations:
-                        # Draw green rectangle around face
-                        cv2.rectangle(display_frame, (left, top), (right, bottom),
-                                      (0, 255, 0), 2)
-
-                        # Check face size
-                        face_width = right - left
-                        face_height = bottom - top
-
-                        if face_width < 150 or face_height < 150:
-                            cv2.putText(display_frame, "Move Closer", (left, top - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                        else:
-                            cv2.putText(display_frame, "Good! Press 'S'", (left, top - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                else:
-                    # Show warning if no face
-                    cv2.putText(display_frame, "No Face Detected!", (50, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-                # Add registration info
-                cv2.putText(display_frame, f"Registering: {name}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(display_frame, f"Reg No: {regno}", (10, 60),
+                # Add registration info overlay
+                cv2.putText(frame, f"Registering: {name}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(frame, f"Reg No: {regno}", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, "Press 'S' to Save", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                cv2.putText(display_frame, "Press 'S' to Save | 'Q' to Quit", (10,
-                                                                               display_frame.shape[0] - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(frame, "Press 'Q' to Quit", (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-                cv2.imshow('Register User - SecureAttend', display_frame)
+                # Detect face in current frame
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                face_locations = face_recognition.face_locations(rgb_frame)
+
+                # Draw rectangle if face detected
+                if face_locations:
+                    top, right, bottom, left = face_locations[0]
+                    cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+                    cv2.putText(frame, "Face Detected ✓", (left, top - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    cv2.putText(frame, "No Face Detected ✗", (10, 150),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                # Show frame
+                cv2.imshow('Register User - SecureAttend', frame)
                 key = cv2.waitKey(1) & 0xFF
 
                 if key == ord('s') or key == ord('S'):
                     if not face_locations:
-                        print("⚠ No face detected! Please position yourself properly.")
+                        print("⚠ No face detected! Please look at the camera and try again.")
                         continue
 
-                    if len(face_locations) > 1:
-                        print("⚠ Multiple faces detected! Only one person should be in frame.")
-                        continue
+                    print("Capturing face...")
 
-                    print("📸 Capturing face...")
+                    # Get face encoding
+                    encodings = face_recognition.face_encodings(rgb_frame, face_locations)
 
-                    # Save high-quality image
-                    cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
-                    # Validate saved image
-                    is_valid, error_msg, encoding = self.validate_face_image(img_path)
-
-                    if is_valid:
-                        face_encoding = encoding
+                    if encodings:
+                        # Save image
+                        cv2.imwrite(img_path, frame)
+                        face_encoding = encodings[0]
                         captured = True
-                        print(f"✓ Face captured and validated")
-                        print(f"✓ Saved to: {img_path}")
+                        print(f"✓ Face captured successfully for {name}")
+                        print(f"✓ Image saved to: {img_path}")
                         break
                     else:
-                        print(f"✗ Validation failed: {error_msg}")
-                        print("  Please try again")
-                        os.remove(img_path)  # Remove invalid image
+                        print("⚠ Could not encode face. Please try again.")
 
                 elif key == ord('q') or key == ord('Q'):
-                    print("❌ Registration cancelled")
+                    print("Registration cancelled by user")
                     break
 
             # Release camera
@@ -935,7 +821,7 @@ class SecureAttendApp:
             cv2.destroyAllWindows()
 
             if captured and face_encoding is not None:
-                print("💾 Saving to database...")
+                print("Saving to database...")
 
                 # Add to database
                 success = self.db.add_user(
@@ -950,27 +836,27 @@ class SecureAttendApp:
                 )
 
                 if success:
-                    print("✓ Saved to database")
+                    print("✓ User saved to database")
 
-                    # Reload users (fast mode)
-                    self.load_registered_users_fast()
+                    # Reload users
+                    self.load_registered_users()
                     self.root.after(0, self.refresh_users)
                     self.root.after(0, self.update_dashboard_stats)
 
-                    # Show success
+                    # Show success message
                     self.root.after(0, lambda: messagebox.showinfo("✅ Success",
                                                                    f"User registered successfully!\n\n" +
                                                                    f"Name: {name}\n" +
-                                                                   f"Reg No: {regno}\n" +
+                                                                   f"Registration Number: {regno}\n" +
                                                                    f"Department: {user_data.get('department', 'N/A')}"))
 
-                    self.update_status(f"✓ Registered: {name}")
-                    print(f"\n✅ Registration complete for {name} ({regno})\n")
+                    self.update_status(f"✓ Registered: {name} ({regno})")
                 else:
-                    print("✗ Database save failed")
+                    print("✗ Failed to save user to database")
                     self.root.after(0, lambda: messagebox.showerror("Error",
-                                                                    "Failed to save to database"))
+                                                                    "Failed to save user to database!"))
             else:
+                print("Registration incomplete or cancelled")
                 self.update_status("Registration cancelled")
 
         except Exception as e:
@@ -988,68 +874,8 @@ class SecureAttendApp:
 
         threading.Thread(target=self.start_attendance, daemon=True).start()
 
-    def validate_face_image(self, img_path):
-        """
-        Validate if an image is suitable for face recognition
-        Returns: (is_valid, error_message, face_encoding or None)
-        """
-        try:
-            # Load image
-            img = cv2.imread(img_path)
-
-            if img is None:
-                return False, "Cannot load image file", None
-
-            # Check size
-            height, width = img.shape[:2]
-            if height < 200 or width < 200:
-                return False, f"Image too small ({width}x{height}), need at least 200x200", None
-
-            # Check brightness
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            brightness = np.mean(gray)
-
-            if brightness < 40:
-                return False, "Image too dark", None
-            elif brightness > 220:
-                return False, "Image too bright", None
-
-            # Convert to RGB
-            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            # Detect face
-            face_locations = face_recognition.face_locations(rgb_img, model='hog')
-
-            if not face_locations:
-                return False, "No face detected", None
-
-            if len(face_locations) > 1:
-                return False, f"Multiple faces detected ({len(face_locations)})", None
-
-            # Check face size
-            top, right, bottom, left = face_locations[0]
-            face_width = right - left
-            face_height = bottom - top
-
-            if face_width < 80 or face_height < 80:
-                return False, f"Face too small ({face_width}x{face_height})", None
-
-            # Get encoding
-            encodings = face_recognition.face_encodings(rgb_img, face_locations, num_jitters=1)
-
-            if not encodings:
-                return False, "Cannot create face encoding", None
-
-            return True, "OK", encodings[0]
-
-        except Exception as e:
-            return False, f"Error: {str(e)}", None
-
     def start_attendance(self):
-        """
-        SMOOTH attendance tracking - NO FLICKERING
-        Replace your existing start_attendance method with this complete version
-        """
+        """Main attendance tracking"""
         try:
             self.attendance_running = True
             self.update_status("Starting attendance...")
@@ -1060,301 +886,154 @@ class SecureAttendApp:
                 self.attendance_running = False
                 return
 
-            # Initialize tracker for smooth detection
-            tracker = AttendanceTracker()
-
             camera_index = int(self.config.get('camera_index', 0))
             cap = cv2.VideoCapture(camera_index)
 
             if not cap.isOpened():
                 self.root.after(0, lambda: messagebox.showerror("Error",
-                                                                "Cannot access camera"))
+                                                                 "Cannot access camera"))
                 self.attendance_running = False
                 return
 
-            # Set camera properties for smooth video
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
             self.update_status("Attendance tracking active")
+            recognized_today = set()
+            frame_count = 0
 
             self.liveness_detector.reset()
             self.emotion_detector.reset()
 
-            print(f"\n{'=' * 70}")
-            print("  ATTENDANCE TRACKING STARTED")
-            print(f"{'=' * 70}")
-            print("  Press 'Q' to stop")
-            print(f"{'=' * 70}\n")
-
-            # Process every N frames for face recognition (smoother)
-            process_interval = 2  # Process every 2nd frame
-
-            # Store detected faces for UI rendering
-            detected_faces = {}  # face_id -> {name, bbox, status, liveness, etc.}
+            print("Attendance started. Press 'Q' to stop.")
 
             while self.attendance_running:
                 ret, frame = cap.read()
                 if not ret:
-                    print("⚠ Failed to read frame")
                     break
 
-                tracker.increment_frame()
+                frame_count += 1
 
-                # Create display frame
-                display_frame = frame.copy()
+                if frame_count % 3 != 0:
+                    cv2.imshow('SecureAttend - Attendance', frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                    continue
 
-                # === FACE DETECTION & RECOGNITION (every N frames) ===
-                if tracker.frame_count % process_interval == 0:
-                    # Resize for faster processing
-                    small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-                    rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+                rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-                    # Detect faces
-                    face_locations = face_recognition.face_locations(rgb_small, model='hog')
-                    face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
+                face_locations = face_recognition.face_locations(rgb_small)
+                face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
 
-                    # Clear old detections
-                    current_detections = set()
+                for face_encoding, face_location in zip(face_encodings, face_locations):
+                    top, right, bottom, left = [v * 2 for v in face_location]
 
-                    for face_encoding, face_location in zip(face_encodings, face_locations):
-                        # Scale back coordinates
-                        top, right, bottom, left = [v * 2 for v in face_location]
+                    face_distances = face_recognition.face_distance(
+                        self.known_encodings, face_encoding)
 
-                        # Match with known faces
-                        matches = face_recognition.compare_faces(
-                            self.known_encodings,
-                            face_encoding,
-                            tolerance=float(self.config.get('face_tolerance', 0.6))
-                        )
+                    if len(face_distances) > 0:
+                        best_match_idx = np.argmin(face_distances)
+                        confidence = round((1 - face_distances[best_match_idx]) * 100, 2)
 
-                        face_distances = face_recognition.face_distance(
-                            self.known_encodings,
-                            face_encoding
-                        )
+                        tolerance = float(self.config.get('face_tolerance', 0.6))
 
-                        if len(face_distances) > 0 and True in matches:
-                            best_match_idx = np.argmin(face_distances)
+                        if face_distances[best_match_idx] < tolerance:
+                            name = self.known_names[best_match_idx]
+                            user_id = self.known_user_ids[best_match_idx]
 
-                            if matches[best_match_idx]:
-                                name = self.known_names[best_match_idx]
-                                user_id = self.known_user_ids[best_match_idx]
-                                confidence = round((1 - face_distances[best_match_idx]) * 100, 2)
+                            # Get user info
+                            user_info = self.db.get_user_info(user_id)
+                            regno = user_info[2] if user_info and user_info[2] else 'N/A'
 
-                                # Get user info
-                                user_info = self.db.get_user_info(user_id)
-                                regno = user_info[2] if user_info and user_info[2] else 'N/A'
+                            # Anti-spoofing
+                            is_live = True
+                            liveness_score = 1.0
 
-                                # === ANTI-SPOOFING (with smoothing) ===
-                                is_live = True
-                                liveness_score = 1.0
+                            if self.config.get('enable_antispoofing', True):
+                                is_live, liveness_score = self.liveness_detector.detect_liveness(
+                                    frame, (top, right, bottom, left))
 
-                                if self.config.get('enable_antispoofing', True):
-                                    is_live_raw, liveness_raw = self.liveness_detector.detect_liveness(
-                                        frame, (top, right, bottom, left)
-                                    )
+                                if not is_live:
+                                    cv2.putText(frame, "⚠ SPOOFING DETECTED!", (10, 60),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                                    cv2.rectangle(frame, (left, top), (right, bottom),
+                                                  (0, 0, 255), 3)
+                                    continue
 
-                                    # Apply smoothing
-                                    is_live, liveness_score = tracker.update_liveness_smooth(
-                                        user_id, liveness_raw
-                                    )
+                            # Emotion detection
+                            emotion = 'Neutral'
+                            engagement = 50.0
 
-                                # Update detection tracker
-                                is_stable = tracker.update_detection(user_id, True, liveness_score)
+                            if self.config.get('enable_emotion', True):
+                                face_region = frame[top:bottom, left:right]
+                                if face_region.size > 0:
+                                    emotion, _ = self.emotion_detector.detect_emotion_simple(face_region)
+                                    engagement = self.emotion_detector.calculate_engagement_score()
 
-                                current_detections.add(user_id)
+                            # Draw on frame
+                            color = (0, 255, 0)
+                            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
 
-                                # Store detection info for rendering
-                                detected_faces[user_id] = {
-                                    'name': name,
-                                    'regno': regno,
-                                    'bbox': (top, right, bottom, left),
-                                    'confidence': confidence,
-                                    'is_live': is_live,
-                                    'liveness_score': liveness_score,
-                                    'is_stable': is_stable,
+                            cv2.putText(frame, f"{name}", (left, top - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                            cv2.putText(frame, f"Reg: {regno}", (left, top - 35),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                            cv2.putText(frame, f"Live: {liveness_score:.2f}", (left, bottom + 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                            # Mark attendance
+                            if user_id not in recognized_today:
+                                attendance_data = {
+                                    'type': 'attendance',
                                     'user_id': user_id,
-                                    'face_encoding': face_encoding
+                                    'name': name,
+                                    'registration_number': regno,
+                                    'timestamp': datetime.datetime.now().isoformat(),
+                                    'liveness_score': liveness_score,
+                                    'confidence': confidence,
+                                    'emotion': emotion,
+                                    'engagement': engagement
                                 }
 
-                                # === MARK ATTENDANCE (only if stable and live) ===
-                                if is_stable and is_live and user_id not in tracker.recognized_today:
-                                    # Emotion detection
-                                    emotion = 'Neutral'
-                                    engagement = 50.0
+                                blockchain_hash = 'N/A'
+                                if self.config.get('enable_blockchain', True):
+                                    blockchain_hash = self.blockchain.add_block(attendance_data)
 
-                                    if self.config.get('enable_emotion', True):
-                                        face_region = frame[top:bottom, left:right]
-                                        if face_region.size > 0:
-                                            emotion, _ = self.emotion_detector.detect_emotion_simple(face_region)
-                                            engagement = self.emotion_detector.calculate_engagement_score()
+                                # Mark in database
+                                success, msg = self.db.mark_attendance(
+                                    user_id, name, regno, liveness_score, emotion,
+                                    engagement, blockchain_hash, face_encoding,
+                                    confidence / 100.0, "Main Campus"
+                                )
 
-                                    # Prepare attendance data
-                                    attendance_data = {
-                                        'type': 'attendance',
-                                        'user_id': user_id,
-                                        'name': name,
-                                        'registration_number': regno,
-                                        'timestamp': datetime.datetime.now().isoformat(),
-                                        'liveness_score': liveness_score,
-                                        'confidence': confidence,
-                                        'emotion': emotion,
-                                        'engagement': engagement
-                                    }
+                                if success:
+                                    recognized_today.add(user_id)
+                                    self.update_status(f"✓ Attendance: {name} ({regno})")
+                                    print(f"✓ Attendance marked: {name} ({regno})")
 
-                                    # Add to blockchain
-                                    blockchain_hash = 'N/A'
-                                    if self.config.get('enable_blockchain', True):
-                                        blockchain_hash = self.blockchain.add_block(attendance_data)
+                cv2.putText(frame, f"Recognized Today: {len(recognized_today)}", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, "Press 'Q' to exit", (10, frame.shape[0] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-                                    # Mark in database
-                                    success, msg = self.db.mark_attendance(
-                                        user_id, name, regno, liveness_score, emotion,
-                                        engagement, blockchain_hash, face_encoding,
-                                        confidence / 100.0, "Main Campus"
-                                    )
-
-                                    if success:
-                                        tracker.recognized_today.add(user_id)
-                                        detected_faces[user_id]['marked'] = True
-                                        self.update_status(f"✓ Attendance: {name} ({regno})")
-                                        print(f"✓ Attendance marked: {name} ({regno}) - Live: {liveness_score:.2f}")
-
-                    # Update detection states for users not currently detected
-                    for user_id in list(detected_faces.keys()):
-                        if user_id not in current_detections:
-                            tracker.update_detection(user_id, False)
-
-                # === RENDER UI (every frame - smooth) ===
-
-                # Draw boxes for all detected/tracked faces
-                for user_id, face_data in detected_faces.items():
-                    if not tracker.should_display(user_id):
-                        continue  # Skip if shouldn't display anymore
-
-                    top, right, bottom, left = face_data['bbox']
-                    name = face_data['name']
-                    regno = face_data['regno']
-                    is_live = face_data['is_live']
-                    liveness_score = face_data['liveness_score']
-                    confidence = face_data['confidence']
-
-                    # Determine box color based on status
-                    if not is_live:
-                        # SPOOFING - Red box
-                        color = (0, 0, 255)
-                        status_text = "⚠ SPOOFING DETECTED"
-                        status_color = (0, 0, 255)
-                    elif user_id in tracker.recognized_today:
-                        # MARKED - Green box
-                        color = (0, 255, 0)
-                        status_text = "✓ ATTENDANCE MARKED"
-                        status_color = (0, 255, 0)
-                    elif face_data.get('is_stable', False):
-                        # DETECTED - Orange box
-                        color = (0, 165, 255)
-                        status_text = "Verifying..."
-                        status_color = (0, 165, 255)
-                    else:
-                        # DETECTING - Yellow box
-                        color = (0, 255, 255)
-                        status_text = "Detecting..."
-                        status_color = (0, 255, 255)
-
-                    # Draw main rectangle (thicker for visibility)
-                    cv2.rectangle(display_frame, (left, top), (right, bottom), color, 3)
-
-                    # Draw semi-transparent background for text
-                    overlay = display_frame.copy()
-                    cv2.rectangle(overlay, (left, top - 70), (right, top), (0, 0, 0), -1)
-                    cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0, display_frame)
-
-                    # Draw name
-                    cv2.putText(display_frame, name, (left + 5, top - 45),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-                    # Draw registration number
-                    cv2.putText(display_frame, f"Reg: {regno}", (left + 5, top - 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-                    # Draw liveness score
-                    cv2.putText(display_frame, f"Live: {liveness_score:.2f}",
-                                (left + 5, top - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-
-                    # Draw status below box
-                    cv2.putText(display_frame, status_text, (left, bottom + 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
-
-                    # Draw confidence
-                    cv2.putText(display_frame, f"Conf: {confidence:.1f}%",
-                                (left, bottom + 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                # === DRAW HEADER INFO ===
-                # Semi-transparent header background
-                header_overlay = display_frame.copy()
-                cv2.rectangle(header_overlay, (0, 0), (display_frame.shape[1], 100),
-                              (0, 0, 0), -1)
-                cv2.addWeighted(header_overlay, 0.7, display_frame, 0.3, 0, display_frame)
-
-                # Title
-                cv2.putText(display_frame, "SecureAttend - Live Attendance", (20, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-
-                # Stats
-                cv2.putText(display_frame,
-                            f"Recognized Today: {len(tracker.recognized_today)}",
-                            (20, 65),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                # Anti-spoofing indicator
                 if self.config.get('enable_antispoofing', True):
-                    cv2.putText(display_frame, "Anti-Spoofing: ACTIVE",
-                                (20, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(frame, "🛡️ Anti-Spoofing: ACTIVE",
+                                (10, frame.shape[0] - 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                # === DRAW FOOTER INFO ===
-                footer_y = display_frame.shape[0] - 20
-                cv2.putText(display_frame, "Press 'Q' to exit", (20, footer_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.imshow('SecureAttend - Attendance', frame)
 
-                # Frame counter
-                fps_text = f"Frame: {tracker.frame_count}"
-                cv2.putText(display_frame, fps_text,
-                            (display_frame.shape[1] - 150, footer_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-                # Show frame
-                cv2.imshow('SecureAttend - Attendance Tracking', display_frame)
-
-                # Handle key press
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == ord('Q'):
-                    print("\n⏹ Stopping attendance tracking...")
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-            # Cleanup
             cap.release()
             cv2.destroyAllWindows()
 
-            print(f"\n{'=' * 70}")
-            print("  ATTENDANCE TRACKING STOPPED")
-            print(f"{'=' * 70}")
-            print(f"  Total Recognized: {len(tracker.recognized_today)}")
-            print(f"{'=' * 70}\n")
-
         except Exception as e:
-            print(f"✗ Attendance error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Attendance error: {e}")
             self.root.after(0, lambda: messagebox.showerror("Error",
                                                             f"Attendance tracking failed: {e}"))
         finally:
             self.attendance_running = False
-            msg = f"Stopped. {len(tracker.recognized_today) if 'tracker' in locals() else 0} users recognized"
+            msg = f"Stopped. {len(recognized_today) if 'recognized_today' in locals() else 0} users"
             self.update_status(msg)
             self.root.after(0, self.refresh_attendance)
             self.root.after(0, self.update_dashboard_stats)
