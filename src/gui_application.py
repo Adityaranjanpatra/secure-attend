@@ -108,6 +108,10 @@ class AttendanceTracker:
 
         return state['is_stable'] and frames_since_seen < self.display_duration
 
+    def is_already_marked(self, user_id: str) -> bool:
+        """Check if user already marked attendance today"""
+        return user_id in self.recognized_today
+
     def increment_frame(self):
         """Increment frame counter"""
         self.frame_count += 1
@@ -1147,6 +1151,20 @@ class SecureAttendApp:
                                 user_info = self.db.get_user_info(user_id)
                                 regno = user_info[2] if user_info and user_info[2] else 'N/A'
 
+                                # ✅ ADD THIS ENTIRE BLOCK ✅
+                                # === CHECK IF ALREADY MARKED TODAY IN DATABASE ===
+                                today = datetime.datetime.now().strftime('%Y-%m-%d')
+                                already_marked_in_db = False
+
+                                # Check database for today's attendance
+                                existing_records = self.db.get_attendance_records(date=today, user_id=user_id)
+                                if existing_records:
+                                    already_marked_in_db = True
+                                    # Add to tracker's recognized list so we don't try to mark again
+                                    tracker.recognized_today.add(user_id)
+                                    print(f"ℹ️ {name} already marked today (found in database)")
+                                # ✅ END OF NEW CODE ✅
+
                                 # === ANTI-SPOOFING (with smoothing) ===
                                 is_live = True
                                 liveness_score = 1.0
@@ -1176,7 +1194,8 @@ class SecureAttendApp:
                                     'liveness_score': liveness_score,
                                     'is_stable': is_stable,
                                     'user_id': user_id,
-                                    'face_encoding': face_encoding
+                                    'face_encoding': face_encoding,
+                                    'already_marked_in_db': already_marked_in_db
                                 }
 
                                 # === MARK ATTENDANCE (only if stable and live) ===
@@ -1218,7 +1237,8 @@ class SecureAttendApp:
 
                                     if success:
                                         tracker.recognized_today.add(user_id)
-                                        detected_faces[user_id]['marked'] = True
+                                        detected_faces[user_id]['just_marked'] = True  # Mark as JUST marked
+                                        detected_faces[user_id]['mark_time'] = tracker.frame_count  # Track when marked
                                         self.update_status(f"✓ Attendance: {name} ({regno})")
                                         print(f"✓ Attendance marked: {name} ({regno}) - Live: {liveness_score:.2f}")
 
@@ -1226,6 +1246,13 @@ class SecureAttendApp:
                     for user_id in list(detected_faces.keys()):
                         if user_id not in current_detections:
                             tracker.update_detection(user_id, False)
+
+                    # Transition just_marked flag to blue after 3 seconds (90 frames at 30fps)
+                    for uid in list(detected_faces.keys()):
+                        if detected_faces[uid].get('just_marked', False):
+                            mark_time = detected_faces[uid].get('mark_time', 0)
+                            if tracker.frame_count - mark_time > 90:  # 3 seconds
+                                detected_faces[uid]['just_marked'] = False
 
                 # === RENDER UI (every frame - smooth) ===
 
@@ -1241,19 +1268,30 @@ class SecureAttendApp:
                     liveness_score = face_data['liveness_score']
                     confidence = face_data['confidence']
 
+                  # Determine box color based on status
+                    # Get the database flag
+                    already_marked_in_db = face_data.get('already_marked_in_db', False)
+
                     # Determine box color based on status
                     if not is_live:
                         # SPOOFING - Red box
                         color = (0, 0, 255)
                         status_text = "⚠ SPOOFING DETECTED"
                         status_color = (0, 0, 255)
-                    elif user_id in tracker.recognized_today:
-                        # MARKED - Green box
-                        color = (0, 255, 0)
-                        status_text = "✓ ATTENDANCE MARKED"
-                        status_color = (0, 255, 0)
+                    elif user_id in tracker.recognized_today or already_marked_in_db:  # ✅ MODIFIED
+                        # Check if JUST marked or was ALREADY marked
+                        if face_data.get('just_marked', False):
+                            # JUST MARKED - Green box (stays green for 3 seconds)
+                            color = (0, 255, 0)
+                            status_text = "✓ ATTENDANCE MARKED"
+                            status_color = (0, 255, 0)
+                        else:
+                            # ALREADY MARKED - Blue box
+                            color = (255, 200, 0)  # Blue in BGR
+                            status_text = "✓ ALREADY MARKED TODAY"
+                            status_color = (255, 200, 0)
                     elif face_data.get('is_stable', False):
-                        # DETECTED - Orange box
+                        # VERIFYING - Orange box
                         color = (0, 165, 255)
                         status_text = "Verifying..."
                         status_color = (0, 165, 255)
